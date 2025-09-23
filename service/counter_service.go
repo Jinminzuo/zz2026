@@ -2,6 +2,7 @@ package service
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -215,5 +216,107 @@ func TagUsersAllHandler(w http.ResponseWriter, r *http.Request) {
 			"openids": openids,
 			"count":   len(openids),
 		},
+	})
+}
+
+// 请求结构
+type TemplateSendReq struct {
+	OpenIDs    []string                     `json:"openids"`       // 用户 openid 列表
+	TemplateID string                       `json:"template_id"`   // 模板 ID
+	URL        string                       `json:"url,omitempty"` // 可选跳转链接
+	Data       map[string]map[string]string `json:"data"`          // 模板数据
+}
+
+// 响应结构
+type TemplateSendResp struct {
+	SuccessList []string `json:"success_list"`
+	FailList    []struct {
+		OpenID string `json:"openid"`
+		Err    string `json:"err"`
+	} `json:"fail_list"`
+}
+
+// Handler: 批量给指定用户推送模板消息
+func SendTemplateToUsersHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_ = json.NewEncoder(w).Encode(JsonResult{Code: -1, ErrorMsg: "只支持 POST"})
+		return
+	}
+
+	var req TemplateSendReq
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10) // 限制64KB
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(JsonResult{Code: -1, ErrorMsg: "JSON 解析失败: " + err.Error()})
+		return
+	}
+
+	if len(req.OpenIDs) == 0 || req.TemplateID == "" || req.Data == nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(JsonResult{Code: -1, ErrorMsg: "参数 openids/template_id/data 必填"})
+		return
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	successList := make([]string, 0)
+	failList := make([]struct {
+		OpenID string `json:"openid"`
+		Err    string `json:"err"`
+	}, 0)
+
+	for _, openid := range req.OpenIDs {
+		templatePayload := map[string]interface{}{
+			"touser":      openid,
+			"template_id": req.TemplateID,
+			"data":        req.Data,
+		}
+		if req.URL != "" {
+			templatePayload["url"] = req.URL
+		}
+		bs, _ := json.Marshal(templatePayload)
+		// 微信云托管免 token
+		url := fmt.Sprintf("%s/cgi-bin/message/template/send", openAPIHost)
+		httpReq, _ := http.NewRequestWithContext(context.Background(), "POST", url, bytes.NewReader(bs))
+		httpReq.Header.Set("Content-Type", "application/json")
+
+		resp, err := client.Do(httpReq)
+		if err != nil {
+			failList = append(failList, struct {
+				OpenID string `json:"openid"`
+				Err    string `json:"err"`
+			}{OpenID: openid, Err: err.Error()})
+			continue
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		var wechatResp struct {
+			ErrCode int    `json:"errcode"`
+			ErrMsg  string `json:"errmsg"`
+		}
+		_ = json.Unmarshal(body, &wechatResp)
+		if wechatResp.ErrCode != 0 {
+			failList = append(failList, struct {
+				OpenID string `json:"openid"`
+				Err    string `json:"err"`
+			}{OpenID: openid, Err: fmt.Sprintf("%d:%s", wechatResp.ErrCode, wechatResp.ErrMsg)})
+		} else {
+			successList = append(successList, openid)
+		}
+
+		time.Sleep(200 * time.Millisecond) // 避免短时间调用过快
+	}
+
+	respData := TemplateSendResp{
+		SuccessList: successList,
+		FailList:    failList,
+	}
+
+	w.Header().Set("Content-Type", "application/json;charset=utf-8")
+	_ = json.NewEncoder(w).Encode(JsonResult{
+		Code: 0,
+		Data: respData,
 	})
 }
