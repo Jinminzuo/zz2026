@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net/http"
+	"strconv"
+	"time"
 )
 
 // JsonResult 返回结构
@@ -107,4 +110,110 @@ func SendHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json;charset=utf-8")
 	w.Write(body)
+}
+
+// TagUsersAllHandler 获取指定 tag 下所有用户（支持分页）
+func TagUsersAllHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_ = json.NewEncoder(w).Encode(JsonResult{
+			Code:     -1,
+			ErrorMsg: "只支持 GET",
+		})
+		return
+	}
+
+	tagIDStr := r.URL.Query().Get("tag_id")
+	if tagIDStr == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(JsonResult{
+			Code:     -1,
+			ErrorMsg: "tag_id 不能为空",
+		})
+		return
+	}
+
+	tagID, err := strconv.Atoi(tagIDStr)
+	if err != nil || tagID <= 0 {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(JsonResult{
+			Code:     -1,
+			ErrorMsg: "tag_id 必须是正整数",
+		})
+		return
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	openids := make([]string, 0)
+	nextOpenid := ""
+
+	for {
+		url := fmt.Sprintf("%s/cgi-bin/user/tag/get", openAPIHost)
+		reqBody := map[string]interface{}{
+			"tagid":       tagID,
+			"next_openid": nextOpenid,
+		}
+		bs, _ := json.Marshal(reqBody)
+		reqOut, _ := http.NewRequestWithContext(r.Context(), "POST", url, bytes.NewReader(bs))
+		reqOut.Header.Set("Content-Type", "application/json")
+
+		resp, err := client.Do(reqOut)
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			_ = json.NewEncoder(w).Encode(JsonResult{
+				Code:     -1,
+				ErrorMsg: "调用微信接口失败: " + err.Error(),
+			})
+			return
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1MB limit
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			w.WriteHeader(http.StatusBadGateway)
+			_ = json.NewEncoder(w).Encode(JsonResult{
+				Code:     -1,
+				ErrorMsg: fmt.Sprintf("微信接口返回状态码 %d", resp.StatusCode),
+				Data:     string(body),
+			})
+			return
+		}
+
+		var wechatResp struct {
+			ErrCode int    `json:"errcode"`
+			ErrMsg  string `json:"errmsg"`
+			Data    struct {
+				Openid []string `json:"openid"`
+			} `json:"data"`
+			NextOpenid string `json:"next_openid"`
+		}
+		_ = json.Unmarshal(body, &wechatResp)
+		if wechatResp.ErrCode != 0 {
+			w.WriteHeader(http.StatusBadGateway)
+			_ = json.NewEncoder(w).Encode(JsonResult{
+				Code:     -1,
+				ErrorMsg: fmt.Sprintf("wechat error: %d %s", wechatResp.ErrCode, wechatResp.ErrMsg),
+				Data:     string(body),
+			})
+			return
+		}
+
+		openids = append(openids, wechatResp.Data.Openid...)
+
+		if wechatResp.NextOpenid == "" || len(wechatResp.Data.Openid) == 0 {
+			break
+		}
+		nextOpenid = wechatResp.NextOpenid
+		time.Sleep(200 * time.Millisecond) // 防止短时间调用过快
+	}
+
+	w.Header().Set("Content-Type", "application/json;charset=utf-8")
+	_ = json.NewEncoder(w).Encode(JsonResult{
+		Code: 0,
+		Data: map[string]interface{}{
+			"openids": openids,
+			"count":   len(openids),
+		},
+	})
 }

@@ -11,6 +11,7 @@ func main() {
 	http.HandleFunc("/", service.HelloWorldHandler)
 	http.HandleFunc("/tags", service.TagsHandler)
 	http.HandleFunc("/send", service.SendHandler)
+	http.HandleFunc("/tagforuser", service.TagUsersAllHandler)
 
 	log.Fatal(http.ListenAndServe(":80", nil))
 }
